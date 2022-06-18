@@ -1259,6 +1259,127 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
     }
 }
 
+/// @title StopLossManager for RubiconMarket
+/// @notice This contract manages stop loss orders as an extension of the RubiconMarket contract
+/// @dev Utilizes DSMath for safe math operations
+contract StopLossManager is DSMath {
+
+    /// @dev Below is the instance of RubiconMarket that this contract will make calls to
+    RubiconMarket internal market;
+
+    /// @dev Below is a customizable mapping by the maker of an order which is the ratio of buy_amt to pay_amt at which to allow strategists to execute order
+    mapping(uint => uint) public stopLossRatio;
+
+    /// @dev Below is a mapping from an address to a boolean indicating if an address is a strategist
+    mapping(address => bool) public isStrategist;
+
+    /// @dev Below is the address of the owner (rubicon team)
+    address public Owner;
+
+    /// @dev Below is the fee to incentivize strategists to execute stop loss orders
+    uint public STOP_LOSS_FEE;
+
+    /// @dev Below is variable to allow for a proxy-friendly constructor
+    bool public initialized;
+
+    /// @dev Proxy-safe initialization of storage
+    /// @param _market address of RubiconMarket instance
+    /// @param _fee amount of ether to be required as a fee for stop loss orders, initially
+    function initialize(address _market, uint _fee) external {
+        require(!initialized);
+        Owner = msg.sender;
+        market = RubiconMarket(_market);
+        STOP_LOSS_FEE = _fee;
+        initialized = true;
+    }
+
+    /// @dev Allow for contract to receive native ether payments
+    receive() external payable {}
+
+    /// @notice The owner of an order can set their stop loss ratio and provide a fee to incentivize strategists to execute it
+    /// @param _id identifier of order in the RubiconMarket contract
+    /// @param _ratio ratio of buy_amt to pay_amt of best offer on the market for buy_gem and pay_gem at which strategists are incentivized to execute order
+    function makeStopLossOrder(uint _id, uint _ratio) external payable {
+        require(_ratio != 0);
+        address owner = market.getOwner(_id);
+        require(msg.sender == owner);
+        (uint pay_amt, , uint buy_amt,) = market.getOffer(_id);
+        require(mul(buy_amt, WAD) / pay_amt < _ratio);
+        require(msg.value >= STOP_LOSS_FEE);
+        stopLossRatio[_id] = _ratio;
+        if (msg.value > STOP_LOSS_FEE) {
+            uint amt = sub(msg.value, STOP_LOSS_FEE);
+            refund(amt);
+        }
+    }
+
+    /// @notice After placing a stop loss order, the maker can cancel the order and take back the fee they paid to place the order
+    /// @param _id Key in stopLossRatio mapping to point to 0
+    function cancelStopLossOrder(uint _id) external {
+        require(stopLossRatio[_id] > 0);
+        address owner = market.getOwner(_id);
+        require(msg.sender == owner);
+        stopLossRatio[_id] = 0;
+        refund(STOP_LOSS_FEE);
+    }
+
+    /// @notice Only strategists may call this function and will be paid a fee to close out the order
+    /// @param _id Identifier of order to fill on RubiconMarket
+    function fillStopLossOrder(uint _id) external {
+        require(isStrategist[msg.sender]);
+        require(detectStopLossHit(_id));
+        (uint pay_amt, ERC20 pay_gem, uint buy_amt, ERC20 buy_gem) = market.getOffer(_id);
+        uint spend = mul(buy_amt, buy_amt) / pay_amt;
+        uint bps = market.getFeeBPS();
+        uint fee = mul(spend, bps) / 10000;
+        require(buy_gem.transferFrom(msg.sender, address(this), add(fee, spend)));
+        market.buy(_id, buy_amt);
+        payable(msg.sender).transfer(STOP_LOSS_FEE);
+        pay_gem.transfer(msg.sender, pay_amt);
+    }
+
+    /// @notice Internal function to determine if market ratio of buy_gem to pay_gem is less than stop loss ratio placed by maker
+    /// @param _id Key in stopLossRatio mapping to observe
+    /// @returns success If stopLossRatio of _id was reached
+    function detectStopLossHit(uint _id) public returns(bool success) {
+        uint stopLoss = stopLossRatio[_id];
+        require(stopLoss > 0);
+        (, ERC20 pay_gem, , ERC20 buy_gem) = market.getOffer(_id);
+        uint ratio = calculateRatio(buy_gem, pay_gem);
+        success = ratio <= stopLoss;
+    }
+
+    /// @notice Internal function to fetch the ratio of buy_gem to pay_gem from the RubiconMarket contract
+    /// @param _buy_gem ERC20 instance of token to observe
+    /// @param _pay_gem ERC20 instance of token to observe
+    /// @returns ratio Ratio of _buy_gem to _pay_gem in best offer on RubiconMarket
+    function calculateRatio(ERC20 _buy_gem, ERC20 _pay_gem) internal returns(uint ratio) {
+        uint offerId = market.getBestOffer(_pay_gem, _buy_gem);
+        (uint pay_amt, , uint buy_amt,) = market.getOffer(offerId);
+        ratio = mul(buy_amt, WAD) / pay_amt;
+    }
+
+    /// @notice External function only callable by owner of contract to whitelist certain addresses to fill stop loss orders
+    /// @param _strategist Address to allow as strategist
+    function allowStrategist(address _strategist) external {
+        require(msg.sender == Owner);
+        isStrategist[_strategist] = true;
+    }
+
+    /// @notice Internal utility function to send funds held by the contract to caller of a function in special cases
+    /// @param _amount Amount of ether to be sent
+    function refund(uint _amount) internal {
+        payable(msg.sender).transfer(_amount);
+    }
+
+    /// @notice External view function of stop loss ratios set by makers
+    /// @param _id Key in the mapping of stop loss order that is wished to view
+    /// @returns ratio Stop loss ratio of _id
+    function viewStopLossRatio(uint _id) external view returns(uint _atio) {
+        ratio = stopLossRatio[_id];
+    }
+}
+
 interface IWETH {
     function deposit() external payable;
 
