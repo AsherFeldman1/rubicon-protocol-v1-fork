@@ -1273,7 +1273,7 @@ contract StopLossManager is DSMath {
     /// @dev Below is a mapping from an address to a boolean indicating if an address is a strategist
     mapping(address => bool) public isStrategist;
 
-    /// @dev Below is the address of the owner (rubicon team)
+    /// @dev Below is the address of the owner (Rubicon team)
     address public Owner;
 
     /// @dev Below is the fee to incentivize strategists to execute stop loss orders
@@ -1375,7 +1375,7 @@ contract StopLossManager is DSMath {
     /// @notice External view function of stop loss ratios set by makers
     /// @param _id Key in the mapping of stop loss order that is wished to view
     /// @returns ratio Stop loss ratio of _id
-    function viewStopLossRatio(uint _id) external view returns(uint _atio) {
+    function viewStopLossRatio(uint _id) external view returns(uint ratio) {
         ratio = stopLossRatio[_id];
     }
 }
