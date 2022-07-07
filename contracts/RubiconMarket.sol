@@ -547,6 +547,12 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
     uint256 public _head; //first unsorted offer id
     uint256 public dustId; // id of the latest offer marked as dust
 
+    uint256 public constant twapArrayLength = 10;
+    mapping(bytes32 => uint256) public currBlock;
+    mapping(bytes32 => uint256) public twapIndexToWrite;
+    mapping(bytes32 => uint256[twapArrayLength]) public twapTotals;
+    mapping(bytes32 => bool) internal twapArrayFilled;
+
     /// @dev Proxy-safe initialization of storage
     function initialize(bool _live, address _feeTo) public {
         require(!initialized, "contract is already initialized");
@@ -671,7 +677,24 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
             ? _buys
             : super.buy;
 
-        return fn(id, amount);
+        bool success = fn(id, amount);
+        if (success) {
+            bytes32 ID = keccak256(abi.encodePacked(address(offers[id].buy_gem), address(offers[id].pay_gem)));
+            if (block.number > currBlock[ID]) {
+                uint buyPayRatio = mul(offers[id].buy_amt, WAD) / offers[id].pay_amt;
+                uint prevTotal = twapTotals[ID][twapIndexToWrite[ID]];
+                if (twapIndexToWrite[ID] == sub(twapArrayLength, 1)) {
+                    twapIndexToWrite[ID] = 0;
+                    if (!twapArrayFilled[ID]) {
+                        twapArrayFilled[ID] = true;
+                    }
+                } else {
+                    twapIndexToWrite[ID]++;
+                }
+                twapTotals[ID][twapIndexToWrite[ID]] = add(buyPayRatio, prevTotal);
+            }
+        }
+        return success;
     }
 
     // Cancel an offer. Refunds offer maker.
@@ -1257,6 +1280,16 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
         feeTo = newFeeTo;
         return true;
     }
+
+    function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _blocks) external view returns(uint) {
+        bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
+        require(twapArrayFilled[ID]);
+        require(_blocks <= twapArrayLength);
+        uint dividend = sub(add(twapIndexToWrite[ID], twapArrayLength), sub(_blocks, 1));
+        uint index = dividend % twapArrayLength;
+        uint difference = sub(twapTotals[ID][twapIndexToWrite[ID]], twapTotals[ID][index]);
+        return difference / _blocks;
+    }
 }
 
 /// @title StopLossManager for RubiconMarket
@@ -1279,17 +1312,25 @@ contract StopLossManager is DSMath {
     /// @dev Below is the fee to incentivize strategists to execute stop loss orders
     uint public STOP_LOSS_FEE;
 
+    /// @dev Below is the duration over which to calculate the TWAP for market price over
+    uint public twapDuration;
+
+    /// @dev Belos is the fee in basis points charged on taker trades
+    uint internal feeBPS;
+
     /// @dev Below is variable to allow for a proxy-friendly constructor
     bool public initialized;
 
     /// @dev Proxy-safe initialization of storage
     /// @param _market address of RubiconMarket instance
     /// @param _fee amount of ether to be required as a fee for stop loss orders, initially
-    function initialize(address _market, uint _fee) external {
+    function initialize(address _market, uint _fee, uint _twapDuration) external {
         require(!initialized);
         Owner = msg.sender;
         market = RubiconMarket(_market);
         STOP_LOSS_FEE = _fee;
+        twapDuration = _twapDuration;
+        feeBPS = 20;
         initialized = true;
     }
 
@@ -1330,8 +1371,7 @@ contract StopLossManager is DSMath {
         require(detectStopLossHit(_id));
         (uint pay_amt, ERC20 pay_gem, uint buy_amt, ERC20 buy_gem) = market.getOffer(_id);
         uint spend = mul(buy_amt, buy_amt) / pay_amt;
-        uint bps = market.getFeeBPS();
-        uint fee = mul(spend, bps) / 10000;
+        uint fee = mul(spend, feeBPS) / 10000;
         require(buy_gem.transferFrom(msg.sender, address(this), add(fee, spend)));
         market.buy(_id, buy_amt);
         payable(msg.sender).transfer(STOP_LOSS_FEE);
@@ -1340,23 +1380,12 @@ contract StopLossManager is DSMath {
 
     /// @notice Internal function to determine if market ratio of buy_gem to pay_gem is less than stop loss ratio placed by maker
     /// @param _id Key in stopLossRatio mapping to observe
-    /// @returns success If stopLossRatio of _id was reached
     function detectStopLossHit(uint _id) public returns(bool success) {
         uint stopLoss = stopLossRatio[_id];
         require(stopLoss > 0);
         (, ERC20 pay_gem, , ERC20 buy_gem) = market.getOffer(_id);
-        uint ratio = calculateRatio(buy_gem, pay_gem);
+        uint ratio = market.getTWAP(pay_gem, buy_gem, twapDuration);
         success = ratio <= stopLoss;
-    }
-
-    /// @notice Internal function to fetch the ratio of buy_gem to pay_gem from the RubiconMarket contract
-    /// @param _buy_gem ERC20 instance of token to observe
-    /// @param _pay_gem ERC20 instance of token to observe
-    /// @returns ratio Ratio of _buy_gem to _pay_gem in best offer on RubiconMarket
-    function calculateRatio(ERC20 _buy_gem, ERC20 _pay_gem) internal returns(uint ratio) {
-        uint offerId = market.getBestOffer(_pay_gem, _buy_gem);
-        (uint pay_amt, , uint buy_amt,) = market.getOffer(offerId);
-        ratio = mul(buy_amt, WAD) / pay_amt;
     }
 
     /// @notice External function only callable by owner of contract to whitelist certain addresses to fill stop loss orders
@@ -1364,6 +1393,12 @@ contract StopLossManager is DSMath {
     function allowStrategist(address _strategist) external {
         require(msg.sender == Owner);
         isStrategist[_strategist] = true;
+    }
+
+    /// @notice External function only callable by owner of contract to change feeBPS according to RubiconMarket
+    /// @param _newFeeBPS New fee being charged on taker trades
+    function setFeeBPS(uint _newFeeBPS) internal {
+        feeBPS = _newFeeBPS;
     }
 
     /// @notice Internal utility function to send funds held by the contract to caller of a function in special cases
@@ -1374,7 +1409,6 @@ contract StopLossManager is DSMath {
 
     /// @notice External view function of stop loss ratios set by makers
     /// @param _id Key in the mapping of stop loss order that is wished to view
-    /// @returns ratio Stop loss ratio of _id
     function viewStopLossRatio(uint _id) external view returns(uint ratio) {
         ratio = stopLossRatio[_id];
     }
