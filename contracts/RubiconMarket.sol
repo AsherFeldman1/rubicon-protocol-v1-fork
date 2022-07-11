@@ -547,11 +547,12 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
     uint256 public _head; //first unsorted offer id
     uint256 public dustId; // id of the latest offer marked as dust
 
-    uint256 public constant twapArrayLength = 10;
-    mapping(bytes32 => uint256) public currBlock;
-    mapping(bytes32 => uint256) public twapIndexToWrite;
-    mapping(bytes32 => uint256[twapArrayLength]) public twapTotals;
-    mapping(bytes32 => bool) internal twapArrayFilled;
+    mapping(bytes32 => uint256[]) public priceCumulative;
+    mapping(bytes32 => uint256[]) public twapTimestamps;
+    mapping(bytes32 => uint256) public nextTwapIndex;
+
+    uint256 public constant maxTwapLength = 10;
+    uint256 public constant TWAP_TIME_UPDATE_THRESHOLD = 1;
 
     /// @dev Proxy-safe initialization of storage
     function initialize(bool _live, address _feeTo) public {
@@ -678,21 +679,10 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
             : super.buy;
 
         bool success = fn(id, amount);
-        if (success) {
-            bytes32 ID = keccak256(abi.encodePacked(address(offers[id].buy_gem), address(offers[id].pay_gem)));
-            if (block.number > currBlock[ID]) {
-                uint buyPayRatio = mul(offers[id].buy_amt, WAD) / offers[id].pay_amt;
-                uint prevTotal = twapTotals[ID][twapIndexToWrite[ID]];
-                if (twapIndexToWrite[ID] == sub(twapArrayLength, 1)) {
-                    twapIndexToWrite[ID] = 0;
-                    if (!twapArrayFilled[ID]) {
-                        twapArrayFilled[ID] = true;
-                    }
-                } else {
-                    twapIndexToWrite[ID]++;
-                }
-                twapTotals[ID][twapIndexToWrite[ID]] = add(buyPayRatio, prevTotal);
-            }
+        bytes32 ID = keccak256(abi.encodePacked(address(offers[id].buy_gem), address(offers[id].pay_gem)));
+        if (success && block.timestamp > add(twapTimestamps[ID][nextTwapIndex[ID] - 1], TWAP_TIME_UPDATE_THRESHOLD)) {
+            uint buyPayRatio = mul(offers[id].buy_amt, WAD) / offers[id].pay_amt;
+            _writeToTwapArray(ID, block.timestamp, buyPayRatio);
         }
         return success;
     }
@@ -1281,14 +1271,40 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
         return true;
     }
 
-    function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _blocks) external view returns(uint) {
+    function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) external view returns(uint) {
         bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
-        require(twapArrayFilled[ID]);
-        require(_blocks <= twapArrayLength);
-        uint dividend = sub(add(twapIndexToWrite[ID], twapArrayLength), sub(_blocks, 1));
-        uint index = dividend % twapArrayLength;
-        uint difference = sub(twapTotals[ID][twapIndexToWrite[ID]], twapTotals[ID][index]);
-        return difference / _blocks;
+        require(priceCumulative[ID].length == maxTwapLength);
+        uint dataPointsSpan = _convertToDataPointSpan(ID, _duration);
+        uint dividend = sub(add(nextTwapIndex[ID], maxTwapLength), sub(dataPointsSpan, 1));
+        uint index = dividend % maxTwapLength;
+        uint difference = sub(priceCumulative[ID][nextTwapIndex[ID]], priceCumulative[ID][index]);
+        return difference / dataPointsSpan;
+    }
+
+    function _convertToDataPointSpan(bytes32 _ID, uint _duration) internal view returns(uint) {
+        uint oldestTimestamp = nextTwapIndex[_ID] == (maxTwapLength - 1) ? 0 : nextTwapIndex[_ID] + 1;
+        uint dataPointRange = sub(twapTimestamps[_ID][nextTwapIndex[_ID]], oldestTimestamp);
+        uint averageDataPointDifference = dataPointRange / maxTwapLength;
+        require(_duration <= mul(maxTwapLength, averageDataPointDifference));
+        uint dataPointsSpan = _duration / averageDataPointDifference;
+        return dataPointsSpan;
+    }
+
+    function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _dataPoint) internal {
+        if (priceCumulative[_ID].length == 0) {
+            priceCumulative[_ID].push(_dataPoint);
+            twapTimestamps[_ID].push(_timestamp);
+        } else if (priceCumulative[_ID].length < maxTwapLength) {
+            uint newTotal = add(priceCumulative[_ID][priceCumulative[_ID].length - 1], _dataPoint);
+            priceCumulative[_ID].push(newTotal);
+            twapTimestamps[_ID].push(_timestamp);
+        } else {
+            uint lastIndex = nextTwapIndex[_ID] == 0 ? (maxTwapLength - 1) : (nextTwapIndex[_ID] - 1);
+            uint newTotal = add(priceCumulative[_ID][lastIndex], _dataPoint);
+            priceCumulative[_ID][nextTwapIndex[_ID]] = newTotal;
+            twapTimestamps[_ID][nextTwapIndex[_ID]] = _timestamp;
+            nextTwapIndex[_ID] = lastIndex == (maxTwapLength - 1) ? 0 : lastIndex + 1;
+        }
     }
 }
 
@@ -1380,7 +1396,7 @@ contract StopLossManager is DSMath {
 
     /// @notice Internal function to determine if market ratio of buy_gem to pay_gem is less than stop loss ratio placed by maker
     /// @param _id Key in stopLossRatio mapping to observe
-    function detectStopLossHit(uint _id) public returns(bool success) {
+    function detectStopLossHit(uint _id) public view returns(bool success) {
         uint stopLoss = stopLossRatio[_id];
         require(stopLoss > 0);
         (, ERC20 pay_gem, , ERC20 buy_gem) = market.getOffer(_id);
