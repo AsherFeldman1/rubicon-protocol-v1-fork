@@ -547,12 +547,17 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
     uint256 public _head; //first unsorted offer id
     uint256 public dustId; // id of the latest offer marked as dust
 
-    mapping(bytes32 => uint256[]) public priceCumulative;
-    mapping(bytes32 => uint256[]) public twapTimestamps;
+    struct dataPointInfo {
+        uint CumulativePrice;
+        uint CumulativeVolume;
+        uint Timestamp;
+    }
+
+    mapping(bytes32 => dataPointInfo[]) public twapDataPoints;
     mapping(bytes32 => uint256) public nextTwapIndex;
 
-    uint256 public constant maxTwapLength = 10;
-    uint256 public constant TWAP_TIME_UPDATE_THRESHOLD = 1;
+    uint256 public constant maxTwapLength = 120;
+    uint256 public constant TWAP_TIME_UPDATE_THRESHOLD = 30;
 
     /// @dev Proxy-safe initialization of storage
     function initialize(bool _live, address _feeTo) public {
@@ -680,9 +685,9 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
 
         bool success = fn(id, amount);
         bytes32 ID = keccak256(abi.encodePacked(address(offers[id].buy_gem), address(offers[id].pay_gem)));
-        if (success && block.timestamp > add(twapTimestamps[ID][nextTwapIndex[ID] - 1], TWAP_TIME_UPDATE_THRESHOLD)) {
+        if (success && block.timestamp > add(twapDataPoints[ID][nextTwapIndex[ID] - 1].Timestamp, TWAP_TIME_UPDATE_THRESHOLD)) {
             uint buyPayRatio = mul(offers[id].buy_amt, WAD) / offers[id].pay_amt;
-            _writeToTwapArray(ID, block.timestamp, buyPayRatio);
+            _writeToTwapArray(ID, block.timestamp, buyPayRatio, amount);
         }
         return success;
     }
@@ -1271,40 +1276,65 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
         return true;
     }
 
-    function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) external view returns(uint) {
+    function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) public view returns(uint) {
         bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
-        require(priceCumulative[ID].length == maxTwapLength);
-        uint dataPointsSpan = _convertToDataPointSpan(ID, _duration);
-        uint dividend = sub(add(nextTwapIndex[ID], maxTwapLength), sub(dataPointsSpan, 1));
-        uint index = dividend % maxTwapLength;
-        uint difference = sub(priceCumulative[ID][nextTwapIndex[ID]], priceCumulative[ID][index]);
-        return difference / dataPointsSpan;
+        require(twapDataPoints[ID].length == maxTwapLength);
+        uint dataPointIndex = _findIndex(ID, _duration);
+        uint span = sub(nextTwapIndex[ID] - 1, dataPointIndex);
+        uint difference = sub(twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativePrice, twapDataPoints[ID][dataPointIndex].CumulativePrice);
+        return difference / span;
     }
 
-    function _convertToDataPointSpan(bytes32 _ID, uint _duration) internal view returns(uint) {
-        uint oldestTimestamp = nextTwapIndex[_ID] == (maxTwapLength - 1) ? 0 : nextTwapIndex[_ID] + 1;
-        uint dataPointRange = sub(twapTimestamps[_ID][nextTwapIndex[_ID]], oldestTimestamp);
-        uint averageDataPointDifference = dataPointRange / maxTwapLength;
-        require(_duration <= mul(maxTwapLength, averageDataPointDifference));
-        uint dataPointsSpan = _duration / averageDataPointDifference;
-        return dataPointsSpan;
+    function getVWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) public view returns(uint) {
+        bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
+        uint averagePrice = getTWAP(buy_gem, pay_gem, _duration);
+        uint dataPointIndex = _findIndex(ID, _duration);
+        uint totalValue = mul(averagePrice, sub(twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeVolume, twapDataPoints[ID][dataPointIndex].CumulativeVolume));
+        return totalValue / twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeVolume;
     }
 
-    function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _dataPoint) internal {
-        if (priceCumulative[_ID].length == 0) {
-            priceCumulative[_ID].push(_dataPoint);
-            twapTimestamps[_ID].push(_timestamp);
-        } else if (priceCumulative[_ID].length < maxTwapLength) {
-            uint newTotal = add(priceCumulative[_ID][priceCumulative[_ID].length - 1], _dataPoint);
-            priceCumulative[_ID].push(newTotal);
-            twapTimestamps[_ID].push(_timestamp);
+    function getAWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration, uint _twapWeighting) public view returns(uint) {
+        require(_twapWeighting <= WAD);
+        uint vwapWeighting = sub(WAD, _twapWeighting);
+        uint twap = mul(getTWAP(buy_gem, pay_gem, _duration), _twapWeighting) / WAD;
+        uint vwap = mul(getVWAP(buy_gem, pay_gem, _duration), vwapWeighting) / WAD;
+        uint weightedPrice = mul(twap, vwap) / WAD;
+        return weightedPrice;
+    }
+
+    function _findIndex(bytes32 _ID, uint _duration) internal view returns(uint) {
+        // find index in data array which has a closest timestamp to now - _duration
+        // use binary search
+    }
+
+    function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _price, uint _volume) internal {
+        dataPointInfo memory point = dataPointInfo(
+            _price,
+            _timestamp,
+            _volume
+        );
+        if (twapDataPoints[_ID].length == 0) {
+            twapDataPoints[_ID].push(point);
+        } else if (twapDataPoints[_ID].length < maxTwapLength) {
+            uint newTotal = add(twapDataPoints[_ID][twapDataPoints[_ID].length - 1].CumulativePrice, _price);
+            uint newVolume = add(twapDataPoints[_ID][twapDataPoints[_ID].length - 1].CumulativeVolume, _volume);
+            point.CumulativePrice = newTotal;
+            point.CumulativeVolume = newVolume;
+            twapDataPoints[_ID].push(point);
         } else {
             uint lastIndex = nextTwapIndex[_ID] == 0 ? (maxTwapLength - 1) : (nextTwapIndex[_ID] - 1);
-            uint newTotal = add(priceCumulative[_ID][lastIndex], _dataPoint);
-            priceCumulative[_ID][nextTwapIndex[_ID]] = newTotal;
-            twapTimestamps[_ID][nextTwapIndex[_ID]] = _timestamp;
+            uint newTotal = add(twapDataPoints[_ID][lastIndex].CumulativePrice, _price);
+            uint newVolume = add(twapDataPoints[_ID][lastIndex].CumulativeVolume, _volume);
+            point.CumulativePrice = newTotal;
+            point.CumulativeVolume = newVolume;
+            twapDataPoints[_ID][nextTwapIndex[_ID]] = point;
             nextTwapIndex[_ID] = lastIndex == (maxTwapLength - 1) ? 0 : lastIndex + 1;
         }
+    }
+
+    function _abs(uint x, uint y) internal returns (uint) {
+        uint abs = x >= y ? sub(x, y) : sub(y, x);
+        return abs;
     }
 }
 
@@ -1328,8 +1358,11 @@ contract StopLossManager is DSMath {
     /// @dev Below is the fee to incentivize strategists to execute stop loss orders
     uint public STOP_LOSS_FEE;
 
-    /// @dev Below is the duration over which to calculate the TWAP for market price over
+    /// @dev Below is the duration over which to calculate the AWAP for market price over
     uint public twapDuration;
+
+    /// @dev Below is the twap vs vwap weighting to calculate for the AWAP
+    uint public twapWeighting;
 
     /// @dev Belos is the fee in basis points charged on taker trades
     uint internal feeBPS;
@@ -1340,12 +1373,13 @@ contract StopLossManager is DSMath {
     /// @dev Proxy-safe initialization of storage
     /// @param _market address of RubiconMarket instance
     /// @param _fee amount of ether to be required as a fee for stop loss orders, initially
-    function initialize(address _market, uint _fee, uint _twapDuration) external {
+    function initialize(address _market, uint _fee, uint _twapDuration, uint _twapWeighting) external {
         require(!initialized);
         Owner = msg.sender;
         market = RubiconMarket(_market);
         STOP_LOSS_FEE = _fee;
         twapDuration = _twapDuration;
+        twapWeighting = _twapWeighting;
         feeBPS = 20;
         initialized = true;
     }
@@ -1400,7 +1434,7 @@ contract StopLossManager is DSMath {
         uint stopLoss = stopLossRatio[_id];
         require(stopLoss > 0);
         (, ERC20 pay_gem, , ERC20 buy_gem) = market.getOffer(_id);
-        uint ratio = market.getTWAP(pay_gem, buy_gem, twapDuration);
+        uint ratio = market.getAWAP(pay_gem, buy_gem, twapDuration, twapWeighting);
         success = ratio <= stopLoss;
     }
 
