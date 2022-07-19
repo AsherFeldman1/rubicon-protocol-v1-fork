@@ -549,11 +549,12 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
 
     struct dataPointInfo {
         uint CumulativePrice;
-        uint CumulativeVolume;
+        uint CumulativeAssetA;
+        uint CumulativeAssetB;
         uint Timestamp;
     }
 
-    mapping(bytes32 => dataPointInfo[]) public twapDataPoints;
+    mapping(bytes32 => dataPointInfo[]) public oracleDataPoints;
     mapping(bytes32 => uint256) public nextTwapIndex;
 
     uint256 public constant maxTwapLength = 120;
@@ -685,9 +686,9 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
 
         bool success = fn(id, amount);
         bytes32 ID = keccak256(abi.encodePacked(address(offers[id].buy_gem), address(offers[id].pay_gem)));
-        if (success && block.timestamp > add(twapDataPoints[ID][nextTwapIndex[ID] - 1].Timestamp, TWAP_TIME_UPDATE_THRESHOLD)) {
+        if (success && block.timestamp > add(oracleDataPoints[ID][nextTwapIndex[ID] - 1].Timestamp, TWAP_TIME_UPDATE_THRESHOLD)) {
             uint buyPayRatio = mul(offers[id].buy_amt, WAD) / offers[id].pay_amt;
-            _writeToTwapArray(ID, block.timestamp, buyPayRatio, amount);
+            _writeToTwapArray(ID, block.timestamp, buyPayRatio, offers[id].buy_amt, offers[id].pay_amt);
         }
         return success;
     }
@@ -1278,64 +1279,100 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
 
     function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) public view returns(uint) {
         bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
-        require(twapDataPoints[ID].length == maxTwapLength);
+        require(oracleDataPoints[ID].length == maxTwapLength);
         uint dataPointIndex = _findIndex(ID, _duration);
         uint span = sub(nextTwapIndex[ID] - 1, dataPointIndex);
-        uint difference = sub(twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativePrice, twapDataPoints[ID][dataPointIndex].CumulativePrice);
+        uint difference = sub(oracleDataPoints[ID][nextTwapIndex[ID] - 1].CumulativePrice, oracleDataPoints[ID][dataPointIndex].CumulativePrice);
         return difference / span;
     }
 
     function getVWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) public view returns(uint) {
         bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
-        uint averagePrice = getTWAP(buy_gem, pay_gem, _duration);
         uint dataPointIndex = _findIndex(ID, _duration);
-        uint totalValue = mul(averagePrice, sub(twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeVolume, twapDataPoints[ID][dataPointIndex].CumulativeVolume));
-        return totalValue / twapDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeVolume;
+        uint assetADifference = sub(oracleDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeAssetA, oracleDataPoints[ID][dataPointIndex].CumulativeAssetA);
+        uint assetBDifference = sub(oracleDataPoints[ID][nextTwapIndex[ID] - 1].CumulativeAssetB, oracleDataPoints[ID][dataPointIndex].CumulativeAssetB);
+        uint ratio = mul(assetADifference, WAD) / assetBDifference; 
+        return ratio;
     }
 
     function getAWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration, uint _twapWeighting) public view returns(uint) {
         require(_twapWeighting <= WAD);
+        uint vwap = getVWAP(buy_gem, pay_gem, _duration);
+        uint twap = getTWAP(buy_gem, pay_gem, _duration);
+        if (_twapWeighting == 0) {
+            return vwap;
+        } else if (_twapWeighting == WAD) {
+            return twap;
+        }
         uint vwapWeighting = sub(WAD, _twapWeighting);
-        uint twap = mul(getTWAP(buy_gem, pay_gem, _duration), _twapWeighting) / WAD;
-        uint vwap = mul(getVWAP(buy_gem, pay_gem, _duration), vwapWeighting) / WAD;
-        uint weightedPrice = mul(twap, vwap) / WAD;
+        uint weightedTwap = mul(twap, _twapWeighting) / WAD;
+        uint weightedVwap = mul(vwap, vwapWeighting) / WAD;
+        uint weightedProduct = mul(weightedTwap, weightedVwap) / WAD;
+        uint weightedPrice = sqrtu(weightedProduct);
         return weightedPrice;
     }
 
     function _findIndex(bytes32 _ID, uint _duration) internal view returns(uint) {
         // find index in data array which has a closest timestamp to now - _duration
         // use binary search
+        uint base = sub(block.timestamp, _duration);
+        dataPointInfo[] memory data = oracleDataPoints[_ID];
     }
 
-    function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _price, uint _volume) internal {
+    function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _price, uint _assetA, uint _assetB) internal {
         dataPointInfo memory point = dataPointInfo(
             _price,
             _timestamp,
-            _volume
+            _assetA,
+            _assetB
         );
-        if (twapDataPoints[_ID].length == 0) {
-            twapDataPoints[_ID].push(point);
-        } else if (twapDataPoints[_ID].length < maxTwapLength) {
-            uint newTotal = add(twapDataPoints[_ID][twapDataPoints[_ID].length - 1].CumulativePrice, _price);
-            uint newVolume = add(twapDataPoints[_ID][twapDataPoints[_ID].length - 1].CumulativeVolume, _volume);
+        uint len = oracleDataPoints[_ID].length;
+        if (len == 0) {
+            oracleDataPoints[_ID].push(point);
+        } else if (len < maxTwapLength) {
+            uint newTotal = add(oracleDataPoints[_ID][len - 1].CumulativePrice, _price);
+            uint newVolumeA = add(oracleDataPoints[_ID][len - 1].CumulativeAssetA, _assetA);
+            uint newVolumeB = add(oracleDataPoints[_ID][len - 1].CumulativeAssetB, _assetB);
             point.CumulativePrice = newTotal;
-            point.CumulativeVolume = newVolume;
-            twapDataPoints[_ID].push(point);
+            point.CumulativeAssetA = newVolumeA;
+            point.CumulativeAssetB = newVolumeB;
+            oracleDataPoints[_ID].push(point);
         } else {
             uint lastIndex = nextTwapIndex[_ID] == 0 ? (maxTwapLength - 1) : (nextTwapIndex[_ID] - 1);
-            uint newTotal = add(twapDataPoints[_ID][lastIndex].CumulativePrice, _price);
-            uint newVolume = add(twapDataPoints[_ID][lastIndex].CumulativeVolume, _volume);
+            uint newTotal = add(oracleDataPoints[_ID][lastIndex].CumulativePrice, _price);
+            uint newVolumeA = add(oracleDataPoints[_ID][lastIndex].CumulativeAssetA, _assetA);
+            uint newVolumeB = add(oracleDataPoints[_ID][lastIndex].CumulativeAssetB, _assetB);
             point.CumulativePrice = newTotal;
-            point.CumulativeVolume = newVolume;
-            twapDataPoints[_ID][nextTwapIndex[_ID]] = point;
+            point.CumulativeAssetA = newVolumeA;
+            point.CumulativeAssetB = newVolumeB;
+            oracleDataPoints[_ID][nextTwapIndex[_ID]] = point;
             nextTwapIndex[_ID] = lastIndex == (maxTwapLength - 1) ? 0 : lastIndex + 1;
         }
     }
 
-    function _abs(uint x, uint y) internal returns (uint) {
-        uint abs = x >= y ? sub(x, y) : sub(y, x);
-        return abs;
+  function sqrtu (uint256 x) private pure returns (uint128) {
+    if (x == 0) return 0;
+    else {
+      uint256 xx = x;
+      uint256 r = 1;
+      if (xx >= 0x100000000000000000000000000000000) { xx >>= 128; r <<= 64; }
+      if (xx >= 0x10000000000000000) { xx >>= 64; r <<= 32; }
+      if (xx >= 0x100000000) { xx >>= 32; r <<= 16; }
+      if (xx >= 0x10000) { xx >>= 16; r <<= 8; }
+      if (xx >= 0x100) { xx >>= 8; r <<= 4; }
+      if (xx >= 0x10) { xx >>= 4; r <<= 2; }
+      if (xx >= 0x8) { r <<= 1; }
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1;
+      r = (r + x / r) >> 1; // Seven iterations should be enough
+      uint256 r1 = x / r;
+      return uint128 (r < r1 ? r : r1);
     }
+  }
 }
 
 /// @title StopLossManager for RubiconMarket
