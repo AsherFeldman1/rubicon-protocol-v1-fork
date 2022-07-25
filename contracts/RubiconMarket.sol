@@ -1313,10 +1313,39 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
     }
 
     function _findIndex(bytes32 _ID, uint _duration) internal view returns(uint) {
-        // find index in data array which has a closest timestamp to now - _duration
-        // use binary search
         uint base = sub(block.timestamp, _duration);
         dataPointInfo[] memory data = oracleDataPoints[_ID];
+        uint pivot = nextTwapIndex[_ID] - 1;
+        if (pivot == data.length - 1) {
+            (uint index, ) = _binarySearch(data, 0, data.length - 1, base);
+            return index;
+        }
+        (uint bestLowerIndex, uint lowerDif) = _binarySearch(data, 0, pivot - 1, base);
+        (uint bestUpperIndex, uint upperDif) = _binarySearch(data, pivot + 1, data.length - 1, base);
+        uint returnVal = upperDif < lowerDif ? bestUpperIndex : bestLowerIndex;
+        return returnVal;
+    }
+
+    function _binarySearch(dataPointInfo[] memory _array, uint _low, uint _high, uint _key) internal view returns(uint, uint) {
+        uint mid = add(_low, _high) / 2;
+        uint best = mid;
+        int bestDifference = abs(int(_array[mid].Timestamp) - int(_key));
+        while (_low != _high) {
+            mid = add(_low, _high) / 2;
+            int dif = abs(int(_array[mid].Timestamp) - int(_key));
+            if (dif < bestDifference) {
+                best = mid;
+                bestDifference = dif;
+            }
+            if (abs(int(_array[mid + 1].Timestamp) - int(_key)) < dif) {
+                _low = mid;
+            } else if (abs(int(_array[mid - 1].Timestamp) - int(_key)) < dif) {
+                _high = mid;
+            } else {
+                return (mid, uint(dif));
+            }
+        }
+        return (best, uint(bestDifference));
     }
 
     function _writeToTwapArray(bytes32 _ID, uint _timestamp, uint _price, uint _assetA, uint _assetB) internal {
@@ -1350,29 +1379,33 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
         }
     }
 
-  function sqrtu (uint256 x) private pure returns (uint128) {
-    if (x == 0) return 0;
-    else {
-      uint256 xx = x;
-      uint256 r = 1;
-      if (xx >= 0x100000000000000000000000000000000) { xx >>= 128; r <<= 64; }
-      if (xx >= 0x10000000000000000) { xx >>= 64; r <<= 32; }
-      if (xx >= 0x100000000) { xx >>= 32; r <<= 16; }
-      if (xx >= 0x10000) { xx >>= 16; r <<= 8; }
-      if (xx >= 0x100) { xx >>= 8; r <<= 4; }
-      if (xx >= 0x10) { xx >>= 4; r <<= 2; }
-      if (xx >= 0x8) { r <<= 1; }
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1;
-      r = (r + x / r) >> 1; // Seven iterations should be enough
-      uint256 r1 = x / r;
-      return uint128 (r < r1 ? r : r1);
+      function sqrtu (uint256 x) private pure returns (uint128) {
+        if (x == 0) return 0;
+        else {
+          uint256 xx = x;
+          uint256 r = 1;
+          if (xx >= 0x100000000000000000000000000000000) { xx >>= 128; r <<= 64; }
+          if (xx >= 0x10000000000000000) { xx >>= 64; r <<= 32; }
+          if (xx >= 0x100000000) { xx >>= 32; r <<= 16; }
+          if (xx >= 0x10000) { xx >>= 16; r <<= 8; }
+          if (xx >= 0x100) { xx >>= 8; r <<= 4; }
+          if (xx >= 0x10) { xx >>= 4; r <<= 2; }
+          if (xx >= 0x8) { r <<= 1; }
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1;
+          r = (r + x / r) >> 1; // Seven iterations should be enough
+          uint256 r1 = x / r;
+          return uint128 (r < r1 ? r : r1);
+        }
+      }
+
+    function abs(int x) private pure returns (int) {
+        return x >= 0 ? x : -x;
     }
-  }
 }
 
 /// @title StopLossManager for RubiconMarket
