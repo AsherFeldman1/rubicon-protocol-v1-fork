@@ -1279,7 +1279,6 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
 
     function getTWAP(ERC20 buy_gem, ERC20 pay_gem, uint _duration) public view returns(uint) {
         bytes32 ID = keccak256(abi.encodePacked(address(buy_gem), address(pay_gem)));
-        require(oracleDataPoints[ID].length == maxTwapLength);
         uint dataPointIndex = _findIndex(ID, _duration);
         uint span = sub(nextTwapIndex[ID] - 1, dataPointIndex);
         uint difference = sub(oracleDataPoints[ID][nextTwapIndex[ID] - 1].CumulativePrice, oracleDataPoints[ID][dataPointIndex].CumulativePrice);
@@ -1375,7 +1374,7 @@ contract RubiconMarket is MatchingEvents, ExpiringMarket, DSNote {
             point.CumulativeAssetA = newVolumeA;
             point.CumulativeAssetB = newVolumeB;
             oracleDataPoints[_ID][nextTwapIndex[_ID]] = point;
-            nextTwapIndex[_ID] = lastIndex == (maxTwapLength - 1) ? 0 : lastIndex + 1;
+            nextTwapIndex[_ID] = nextTwapIndex[_ID] == (maxTwapLength - 1) ? 0 : nextTwapIndex[_ID] + 1;
         }
     }
 
